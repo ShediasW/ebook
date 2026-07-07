@@ -91,9 +91,10 @@ function median(arr) {
   return s[Math.floor(s.length / 2)];
 }
 
-// 리더 모드 화면 렌더링
+// 리더 모드 화면 렌더링 (문단 DOM 구성)
 export function renderReader(els, content) {
   const root = els.readerContent;
+  root.style.transform = '';
   root.innerHTML = '';
 
   if (content.source === 'ocr') {
@@ -115,7 +116,25 @@ export function renderReader(els, content) {
       root.appendChild(el);
     }
   }
-  els.readerView.scrollTop = 0;
+}
+
+// 내용을 화면(프레임) 크기의 다단으로 흘려 넣어, 스크롤 없이
+// 한 화면씩 가로로 넘길 수 있게 분할한다. 반환: { width, gap, total }
+export function paginateReader(els) {
+  const content = els.readerContent;
+  content.style.transform = '';
+  const width = content.clientWidth;
+  const gap = Math.max(44, Math.round(width * 0.1));
+  content.style.columnWidth = `${width}px`;
+  content.style.columnGap = `${gap}px`;
+  // scrollWidth = total*(width+gap) - gap
+  const total = Math.max(1, Math.round((content.scrollWidth + gap) / (width + gap)));
+  return { width, gap, total };
+}
+
+// n번째 화면(0부터)으로 이동
+export function showSubPage(els, meta, index) {
+  els.readerContent.style.transform = `translateX(${-index * (meta.width + meta.gap)}px)`;
 }
 
 // 읽기 설정을 CSS 변수/속성으로 반영
