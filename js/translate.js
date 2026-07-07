@@ -9,23 +9,32 @@ export function initTranslate(els) {
   let selectedText = '';
   let anchorRect = null;
 
+  const refreshFromSelection = () => {
+    const sel = window.getSelection();
+    const text = sel?.toString().trim() ?? '';
+    if (!text || !sel.rangeCount || !els.viewer.contains(sel.anchorNode?.parentElement ?? sel.anchorNode)) {
+      btn.hidden = true;
+      return;
+    }
+    selectedText = text;
+    anchorRect = sel.getRangeAt(0).getBoundingClientRect();
+    showButton(btn, anchorRect);
+  };
+
   document.addEventListener('mouseup', (e) => {
     if (popup.contains(e.target) || btn.contains(e.target)) return;
     // 클릭 직후 selection이 확정되도록 다음 틱에 확인
-    setTimeout(() => {
-      const sel = window.getSelection();
-      const text = sel?.toString().trim() ?? '';
-      if (!text || !els.viewer.contains(sel.anchorNode?.parentElement ?? sel.anchorNode)) {
-        btn.hidden = true;
-        return;
-      }
-      selectedText = text;
-      anchorRect = sel.getRangeAt(0).getBoundingClientRect();
-      showButton(btn, anchorRect);
-    }, 0);
+    setTimeout(refreshFromSelection, 0);
   });
 
-  document.addEventListener('mousedown', (e) => {
+  // iOS 등 터치 기기: 선택 핸들 드래그는 mouseup이 없으므로 selectionchange로 감지
+  let selTimer = null;
+  document.addEventListener('selectionchange', () => {
+    clearTimeout(selTimer);
+    selTimer = setTimeout(refreshFromSelection, 300);
+  });
+
+  document.addEventListener('pointerdown', (e) => {
     if (!popup.contains(e.target) && !btn.contains(e.target)) {
       popup.hidden = true;
       btn.hidden = true;

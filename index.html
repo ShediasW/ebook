@@ -2,15 +2,23 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#f7f7f8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="PDF 이북">
 <title>PDF 이북 뷰어</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body data-theme="light">
 
 <header class="toolbar">
   <div class="toolbar-left">
-    <button id="btn-open" class="btn btn-primary">📂 PDF 열기</button>
+    <button id="btn-open" class="btn btn-primary">📂<span class="btn-label"> PDF 열기</span></button>
     <span id="file-name" class="file-name" title=""></span>
   </div>
   <div class="toolbar-center">

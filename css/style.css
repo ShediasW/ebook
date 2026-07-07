@@ -63,6 +63,13 @@ html, body {
 }
 
 body {
+  /* iOS 사파리 주소창 변화에 맞춘 동적 뷰포트 높이 */
+  height: 100dvh;
+  touch-action: manipulation; /* 더블탭 확대 방지 */
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-sans);
@@ -81,7 +88,8 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 12px;
+  padding: 0 max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
+  margin-top: env(safe-area-inset-top);
   background: var(--toolbar-bg);
   border-bottom: 1px solid var(--border);
   z-index: 30;
@@ -135,7 +143,7 @@ body {
   color: var(--text);
   border-radius: 6px;
   padding: 6px 4px;
-  font-size: 14px;
+  font-size: 16px; /* 16px 미만이면 iOS가 포커스 시 화면을 확대함 */
 }
 .page-indicator input::-webkit-outer-spin-button,
 .page-indicator input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
@@ -303,6 +311,12 @@ body {
 .nav-zone:hover span { opacity: 0.95; }
 .nav-zone-left { left: 0; }
 .nav-zone-right { right: 0; }
+
+/* 터치 기기: 호버가 없으므로 화살표를 은은하게 상시 표시, 존 폭 축소 */
+@media (hover: none) {
+  .nav-zone { width: 44px; }
+  .nav-zone span { opacity: 0.35; width: 36px; height: 36px; font-size: 16px; }
+}
 
 /* 로딩 / OCR 진행률 */
 .loading-overlay {
@@ -491,8 +505,17 @@ body {
 /* 모바일 */
 @media (max-width: 640px) {
   .file-name { display: none; }
-  .toolbar { padding: 0 6px; }
-  .btn { padding: 6px 8px; font-size: 13px; }
-  .reader-view { padding: 12px 8px 32px; }
-  .reader-content { padding: 28px 20px; }
+  .btn-label { display: none; } /* 열기 버튼은 아이콘만 */
+  #btn-font-minus, #btn-font-plus { display: none; } /* 글자 크기는 설정 패널에서 */
+  .toolbar {
+    padding: 0 max(6px, env(safe-area-inset-right)) 0 max(6px, env(safe-area-inset-left));
+  }
+  .btn { padding: 8px 9px; font-size: 13px; }
+  .page-indicator input { width: 46px; }
+  .reader-view {
+    padding: 12px 8px calc(32px + env(safe-area-inset-bottom));
+  }
+  .reader-content { padding: 28px 20px; font-size: calc(var(--reader-font-size) * 0.95); }
+  .settings-panel { padding-bottom: calc(32px + env(safe-area-inset-bottom)); }
+  .translate-popup { max-height: 40vh; }
 }

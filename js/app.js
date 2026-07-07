@@ -229,8 +229,39 @@ function bindEvents() {
   // 페이지 이동
   els.btnPrev.addEventListener('click', () => goPage(-1));
   els.btnNext.addEventListener('click', () => goPage(1));
-  els.navLeft.addEventListener('click', () => goPage(-1));
-  els.navRight.addEventListener('click', () => goPage(1));
+  const zoneGo = (delta) => {
+    if (window.getSelection()?.toString()) return; // 텍스트 선택 중엔 넘기지 않음
+    goPage(delta);
+  };
+  els.navLeft.addEventListener('click', () => zoneGo(-1));
+  els.navRight.addEventListener('click', () => zoneGo(1));
+
+  // 터치 스와이프로 페이지 넘김 (아이폰 등)
+  let swipe = null;
+  els.viewer.addEventListener(
+    'touchstart',
+    (e) => {
+      swipe =
+        e.touches.length === 1
+          ? { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() }
+          : null;
+    },
+    { passive: true }
+  );
+  els.viewer.addEventListener(
+    'touchend',
+    (e) => {
+      if (!swipe) return;
+      const dx = e.changedTouches[0].clientX - swipe.x;
+      const dy = e.changedTouches[0].clientY - swipe.y;
+      const fast = Date.now() - swipe.t < 600;
+      swipe = null;
+      if (!fast || Math.abs(dx) < 70 || Math.abs(dy) > Math.abs(dx) * 0.6) return;
+      if (window.getSelection()?.toString()) return;
+      goPage(dx < 0 ? 1 : -1);
+    },
+    { passive: true }
+  );
   els.pageInput.addEventListener('change', () => {
     const n = Number(els.pageInput.value);
     if (Number.isFinite(n)) showPage(n);
