@@ -1,0 +1,28 @@
+name: Deploy to GitHub Pages
+
+# 푸시된 정적 파일을 gh-pages 브랜치로 동기화한다.
+# (Pages 소스가 gh-pages 브랜치로 설정되어 있어 푸시만으로 배포됨)
+on:
+  push:
+    branches:
+      - main
+      - claude/pdf-ebook-viewer-a90itg
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .
+          publish_branch: gh-pages
