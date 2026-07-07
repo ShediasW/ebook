@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF 이북 뷰어</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body data-theme="light">
+
+<header class="toolbar">
+  <div class="toolbar-left">
+    <button id="btn-open" class="btn btn-primary">📂 PDF 열기</button>
+    <span id="file-name" class="file-name" title=""></span>
+  </div>
+  <div class="toolbar-center">
+    <button id="btn-prev" class="btn btn-icon" disabled title="이전 페이지 (←)">◀</button>
+    <span class="page-indicator">
+      <input id="page-input" type="number" min="1" value="1" disabled>
+      <span class="page-sep">/</span>
+      <span id="page-total">–</span>
+    </span>
+    <button id="btn-next" class="btn btn-icon" disabled title="다음 페이지 (→)">▶</button>
+  </div>
+  <div class="toolbar-right">
+    <button id="btn-mode" class="btn" disabled title="리더 모드 ↔ 원본 모드 전환">원본 보기</button>
+    <button id="btn-font-minus" class="btn btn-icon" title="글자 작게">A−</button>
+    <button id="btn-font-plus" class="btn btn-icon" title="글자 크게">A＋</button>
+    <button id="btn-settings" class="btn btn-icon" title="읽기 설정">⚙</button>
+  </div>
+</header>
+
+<main id="viewer" class="viewer">
+
+  <div id="welcome" class="welcome">
+    <div class="welcome-box">
+      <div class="welcome-icon">📖</div>
+      <h1>PDF 이북 뷰어</h1>
+      <p>PDF 파일을 여기에 끌어다 놓거나, 아래 버튼으로 열어주세요.</p>
+      <button id="btn-open-welcome" class="btn btn-primary btn-lg">PDF 파일 열기</button>
+      <ul class="welcome-features">
+        <li>📖 한 화면에 한 페이지씩, 이북처럼 읽기</li>
+        <li>🔤 텍스트 추출 리더 모드 — 글꼴·줄간격·테마 조절</li>
+        <li>🌐 문장을 드래그하면 한국어 번역</li>
+        <li>🔍 스캔(이미지) PDF는 자동 OCR로 텍스트 인식</li>
+      </ul>
+    </div>
+  </div>
+
+  <article id="reader-view" class="reader-view" hidden>
+    <div id="reader-content" class="reader-content"></div>
+  </article>
+
+  <div id="original-view" class="original-view" hidden>
+    <div id="page-wrapper" class="page-wrapper">
+      <canvas id="pdf-canvas"></canvas>
+      <div id="text-layer" class="textLayer"></div>
+      <div id="ocr-layer" class="ocr-layer"></div>
+    </div>
+  </div>
+
+  <div id="nav-left" class="nav-zone nav-zone-left" hidden><span>◀</span></div>
+  <div id="nav-right" class="nav-zone nav-zone-right" hidden><span>▶</span></div>
+
+  <div id="loading-overlay" class="loading-overlay" hidden>
+    <div class="loading-box">
+      <div class="spinner"></div>
+      <div id="loading-text">불러오는 중…</div>
+      <div class="progress-track" id="progress-track" hidden>
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="drop-hint" class="drop-hint" hidden>여기에 PDF를 놓으세요</div>
+</main>
+
+<aside id="settings-panel" class="settings-panel" hidden>
+  <div class="settings-header">
+    <h2>읽기 설정</h2>
+    <button id="btn-settings-close" class="btn btn-icon">✕</button>
+  </div>
+
+  <section class="settings-group">
+    <h3>테마</h3>
+    <div class="theme-buttons">
+      <button class="theme-btn theme-btn-light" data-theme-value="light">라이트</button>
+      <button class="theme-btn theme-btn-sepia" data-theme-value="sepia">세피아</button>
+      <button class="theme-btn theme-btn-dark" data-theme-value="dark">다크</button>
+    </div>
+  </section>
+
+  <section class="settings-group">
+    <h3>글꼴</h3>
+    <div class="segmented">
+      <button data-font-value="serif" class="seg-btn">명조체</button>
+      <button data-font-value="sans" class="seg-btn">고딕체</button>
+    </div>
+  </section>
+
+  <section class="settings-group">
+    <h3>글자 크기 <span class="setting-value" id="val-font-size"></span></h3>
+    <input type="range" id="set-font-size" min="14" max="30" step="1">
+  </section>
+
+  <section class="settings-group">
+    <h3>줄 간격 <span class="setting-value" id="val-line-height"></span></h3>
+    <input type="range" id="set-line-height" min="1.4" max="2.2" step="0.1">
+  </section>
+
+  <section class="settings-group">
+    <h3>본문 폭 <span class="setting-value" id="val-max-width"></span></h3>
+    <input type="range" id="set-max-width" min="480" max="900" step="20">
+  </section>
+
+  <section class="settings-group">
+    <h3>OCR 인식 언어 <small>(스캔 PDF용)</small></h3>
+    <select id="set-ocr-lang">
+      <option value="eng">영어</option>
+      <option value="kor">한국어</option>
+      <option value="eng+kor">영어 + 한국어</option>
+    </select>
+  </section>
+</aside>
+
+<button id="translate-btn" class="translate-btn" hidden>🌐 번역</button>
+
+<div id="translate-popup" class="translate-popup" hidden>
+  <div class="translate-popup-header">
+    <span>한국어 번역</span>
+    <button id="translate-close" class="btn btn-icon">✕</button>
+  </div>
+  <div id="translate-original" class="translate-original"></div>
+  <div id="translate-result" class="translate-result"></div>
+</div>
+
+<input type="file" id="file-input" accept="application/pdf,.pdf" hidden>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
