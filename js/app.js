@@ -1,7 +1,13 @@
 // 진입점: 파일 열기, 상태 관리, 페이지 이동, 모드 전환, 설정 패널
 
 import { openDocument, renderOriginalPage } from './viewer.js';
-import { buildParagraphs, renderReader, applySettings } from './reader.js';
+import {
+  buildParagraphs,
+  renderReader,
+  paginateReader,
+  showSubPage,
+  applySettings,
+} from './reader.js';
 import { hasMeaningfulText, ocrPage } from './ocr.js';
 import { initTranslate } from './translate.js';
 
@@ -11,7 +17,9 @@ const els = {
   viewer: $('viewer'),
   welcome: $('welcome'),
   readerView: $('reader-view'),
+  readerFrame: $('reader-frame'),
   readerContent: $('reader-content'),
+  pagePill: $('page-pill'),
   originalView: $('original-view'),
   pageWrapper: $('page-wrapper'),
   pdfCanvas: $('pdf-canvas'),
@@ -54,6 +62,8 @@ const state = {
   page: 1,
   total: 0,
   mode: 'reader', // 'reader' | 'original'
+  subPage: 0, // 리더 모드에서 현재 PDF 페이지 안의 화면 번호
+  subMeta: { width: 0, gap: 0, total: 1 },
   contentCache: new Map(), // page -> { source, paragraphs, words?, width?, height? }
   settings: loadSettings(),
   renderSeq: 0,
@@ -121,6 +131,7 @@ async function openFile(file) {
     els.navRight.hidden = false;
 
     await showPage(state.page);
+    showUI(); // 잠시 후 자동으로 UI 숨김 → 몰입 모드
   } catch (err) {
     console.error(err);
     hideLoading();
@@ -154,7 +165,9 @@ async function getPageContent(pageNum) {
 }
 
 // ===== 페이지 표시 =====
-async function showPage(pageNum) {
+// opts.fromEnd: 이전 페이지로 넘어올 때 그 페이지의 마지막 화면으로
+// opts.keepSub: 리사이즈/설정 변경 시 현재 화면 위치 유지(범위 내로 보정)
+async function showPage(pageNum, opts = {}) {
   if (!state.pdf) return;
   pageNum = Math.max(1, Math.min(pageNum, state.total));
   state.page = pageNum;
@@ -171,13 +184,20 @@ async function showPage(pageNum) {
       els.readerView.hidden = false;
       els.originalView.hidden = true;
       renderReader(els, content);
+      state.subMeta = paginateReader(els);
+      const last = state.subMeta.total - 1;
+      state.subPage = opts.fromEnd ? last : opts.keepSub ? Math.min(state.subPage, last) : 0;
+      showSubPage(els, state.subMeta, state.subPage);
     } else {
       els.readerView.hidden = true;
       els.originalView.hidden = false;
+      state.subMeta = { width: 0, gap: 0, total: 1 };
+      state.subPage = 0;
       const page = await state.pdf.getPage(pageNum);
       await renderOriginalPage(els, page, content);
       if (seq !== state.renderSeq) return;
     }
+    updateToolbar();
   } catch (err) {
     console.error('페이지 표시 실패:', err);
   } finally {
@@ -187,14 +207,48 @@ async function showPage(pageNum) {
 
 function updateToolbar() {
   els.pageInput.value = state.page;
-  els.btnPrev.disabled = !state.pdf || state.page <= 1;
-  els.btnNext.disabled = !state.pdf || state.page >= state.total;
+  const atStart = state.page <= 1 && state.subPage <= 0;
+  const atEnd = state.page >= state.total && state.subPage >= state.subMeta.total - 1;
+  els.btnPrev.disabled = !state.pdf || atStart;
+  els.btnNext.disabled = !state.pdf || atEnd;
   els.btnMode.textContent = state.mode === 'reader' ? '원본 보기' : '리더 보기';
+  if (state.pdf) {
+    const sub = state.subMeta.total > 1 ? ` · ${state.subPage + 1}/${state.subMeta.total}` : '';
+    els.pagePill.textContent = `${state.page} / ${state.total}${sub}`;
+    els.pagePill.hidden = false;
+  } else {
+    els.pagePill.hidden = true;
+  }
 }
 
+// 리더 모드에서는 페이지 안의 화면(서브페이지)을 먼저 넘기고,
+// 화면이 끝나면 다음/이전 PDF 페이지로 넘어간다.
 function goPage(delta) {
-  const next = state.page + delta;
-  if (state.pdf && next >= 1 && next <= state.total) showPage(next);
+  if (!state.pdf) return;
+  if (state.mode === 'reader') {
+    const next = state.subPage + delta;
+    if (next >= 0 && next < state.subMeta.total) {
+      state.subPage = next;
+      showSubPage(els, state.subMeta, state.subPage);
+      updateToolbar();
+      return;
+    }
+  }
+  const nextPage = state.page + delta;
+  if (nextPage >= 1 && nextPage <= state.total) showPage(nextPage, { fromEnd: delta < 0 });
+}
+
+// ===== 몰입 모드: 읽는 동안 UI 숨김, 탭하면 잠시 표시 =====
+let uiTimer = null;
+function showUI(autoHide = true) {
+  document.body.classList.remove('ui-hidden');
+  clearTimeout(uiTimer);
+  if (autoHide && state.pdf) uiTimer = setTimeout(hideUI, 3500);
+}
+function hideUI() {
+  clearTimeout(uiTimer);
+  if (!state.pdf || !els.settingsPanel.hidden) return; // 설정 패널이 열려 있으면 유지
+  document.body.classList.add('ui-hidden');
 }
 
 // ===== 이벤트 연결 =====
@@ -275,6 +329,22 @@ function bindEvents() {
     else if (e.key === 'End') showPage(state.total);
   });
 
+  // 화면 탭 → UI 표시/숨김 토글 (몰입 모드)
+  els.viewer.addEventListener('click', (e) => {
+    if (!state.pdf || !els.loadingOverlay.hidden) return;
+    if (e.target.closest('.nav-zone')) return; // 페이지 이동 존은 제외
+    if (window.getSelection()?.toString()) return; // 텍스트 선택 중 제외
+    if (document.body.classList.contains('ui-hidden')) showUI();
+    else hideUI();
+  });
+  // 툴바를 만지는 동안에는 숨김 타이머 연장
+  document.querySelector('.toolbar').addEventListener('pointerdown', () => showUI());
+  els.settingsPanel.addEventListener('pointerdown', () => showUI(false));
+  // 데스크톱: 마우스를 화면 위쪽으로 가져가면 UI 표시
+  window.addEventListener('mousemove', (e) => {
+    if (state.pdf && e.clientY < 48 && document.body.classList.contains('ui-hidden')) showUI();
+  });
+
   // 보기 모드 전환
   els.btnMode.addEventListener('click', () => {
     state.mode = state.mode === 'reader' ? 'original' : 'reader';
@@ -291,15 +361,16 @@ function bindEvents() {
   });
   $('btn-settings-close').addEventListener('click', () => {
     els.settingsPanel.hidden = true;
+    showUI();
   });
   bindSettingsControls();
 
-  // 창 크기 변경 시 원본 모드 리렌더링
+  // 창 크기 변경 시 현재 페이지 재배치(리더 모드 재분할 포함)
   let resizeTimer = null;
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
-      if (state.pdf && state.mode === 'original') showPage(state.page);
+      if (state.pdf) showPage(state.page, { keepSub: true });
     }, 200);
   });
 }
@@ -344,10 +415,16 @@ function bindSettingsControls() {
   });
 }
 
+let rerenderTimer = null;
 function applyAndSaveSettings() {
   applySettings(state.settings);
   syncSettingsUI();
   saveSettings();
+  // 글꼴/크기/폭이 바뀌면 리더 모드 화면 분할을 다시 계산
+  if (state.pdf && state.mode === 'reader') {
+    clearTimeout(rerenderTimer);
+    rerenderTimer = setTimeout(() => showPage(state.page, { keepSub: true }), 150);
+  }
 }
 
 function syncSettingsUI() {
