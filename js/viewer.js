@@ -22,10 +22,26 @@ export async function loadPdfJs() {
   return pdfjsLib;
 }
 
-export async function openDocument(arrayBuffer) {
+// 대용량 파일(수백 MB)을 통째로 메모리에 올리지 않고, 필요한 바이트 구간만
+// File.slice()로 읽어 PDF.js에 공급한다(스트리밍). 피크 메모리를 크게 낮춘다.
+export async function openDocument(file) {
   const lib = await loadPdfJs();
+
+  // File의 바이트 범위를 요청 시점에만 디스크에서 읽어오는 range 전송기
+  const transport = new lib.PDFDataRangeTransport(file.size, new Uint8Array(0), false, file.name);
+  transport.requestDataRange = (begin, end) => {
+    file
+      .slice(begin, end)
+      .arrayBuffer()
+      .then((buf) => transport.onDataRange(begin, new Uint8Array(buf)))
+      .catch((err) => console.error('range 읽기 실패:', err));
+  };
+
   return lib.getDocument({
-    data: arrayBuffer,
+    range: transport,
+    disableAutoFetch: true, // 앞부분을 미리 통째로 당겨오지 않음
+    disableStream: true, // 전체 스트림 대신 range 요청만 사용
+    rangeChunkSize: 1 << 20, // 1MB 단위로 요청
     cMapUrl: `${PDFJS_BASE}/cmaps/`,
     cMapPacked: true,
   }).promise;
@@ -72,6 +88,7 @@ export async function renderOriginalPage(els, pdfPage, content) {
   } else {
     await renderTextLayer(els.textLayer, pdfPage, cssViewport, scale);
   }
+  pdfPage.cleanup(); // 이 페이지의 내부 렌더 캐시(이미지 등) 해제 → 메모리 회수
 }
 
 // 텍스트 PDF: pdf.js TextLayer로 드래그 선택 가능한 투명 텍스트 생성
