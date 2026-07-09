@@ -20,6 +20,41 @@ let worker = null;
 let workerLang = null;
 let progressHandler = null;
 
+// ── OCR 작업 우선순위 큐 ──────────────────────────────────────
+// 워커가 하나뿐이므로, 사용자가 보는 페이지(전경, priority=true)를 배경 일괄
+// 인식(priority=false)보다 앞세운다. 진행 중인 작업은 중단하지 않고, 대기열에서만
+// 새치기한다(전경 대기 시간은 최대 한 페이지 분량).
+const ocrQueue = [];
+let draining = false;
+
+function enqueueOcr(priority, task) {
+  return new Promise((resolve, reject) => {
+    const item = { priority, task, resolve, reject };
+    if (priority) {
+      const idx = ocrQueue.findIndex((q) => !q.priority);
+      if (idx === -1) ocrQueue.push(item);
+      else ocrQueue.splice(idx, 0, item);
+    } else {
+      ocrQueue.push(item);
+    }
+    drainOcr();
+  });
+}
+
+async function drainOcr() {
+  if (draining) return;
+  draining = true;
+  while (ocrQueue.length) {
+    const item = ocrQueue.shift();
+    try {
+      item.resolve(await item.task());
+    } catch (err) {
+      item.reject(err);
+    }
+  }
+  draining = false;
+}
+
 // 페이지에 의미 있는 텍스트 레이어가 있는지 (있으면 OCR 불필요)
 export function hasMeaningfulText(textContent) {
   const merged = textContent.items.map((it) => it.str).join('').replace(/\s+/g, '');
@@ -69,9 +104,15 @@ async function getWorker(lang, onProgress) {
   return worker;
 }
 
-// 페이지를 고해상도 캔버스로 렌더링한 뒤 OCR 실행
+// 페이지를 고해상도 캔버스로 렌더링한 뒤 OCR 실행 (우선순위 큐 경유)
+// opts.priority=false 이면 배경 작업으로 취급해 전경 요청에 양보한다.
 // 반환: { paragraphs: [{text, heading}], words: [{text, bbox}], width, height }
-export async function ocrPage(pdfPage, lang, onProgress) {
+export function ocrPage(pdfPage, lang, onProgress, opts = {}) {
+  const priority = opts.priority !== false; // 기본: 전경(우선)
+  return enqueueOcr(priority, () => ocrPageNow(pdfPage, lang, onProgress));
+}
+
+async function ocrPageNow(pdfPage, lang, onProgress) {
   const base = pdfPage.getViewport({ scale: 1 });
   const scale = Math.min(3, Math.max(1.2, ocrTargetWidth() / base.width));
   const viewport = pdfPage.getViewport({ scale });
