@@ -77,7 +77,32 @@ const state = {
 };
 
 // 배경 일괄 OCR 상태
-const bg = { active: false, fileKey: null, lang: null, done: 0, total: 0, failed: 0 };
+const bg = { active: false, fileKey: null, lang: null, done: 0, total: 0, failed: 0, nextPage: 1 };
+
+// 화면 꺼짐 방지 (Wake Lock): 배경 인식 중 화면이 자동으로 잠기지 않게 유지.
+// iOS는 백그라운드로 가면 JS를 멈추므로 "화면을 켜 둔 채" 두는 것이 최선이다.
+let wakeLock = null;
+async function acquireWakeLock() {
+  try {
+    if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener?.('release', () => {
+        wakeLock = null;
+      });
+    }
+  } catch {
+    wakeLock = null; // 거부/미지원 — 화면 잠김 방지는 못 하지만 인식 자체는 진행
+  }
+}
+async function releaseWakeLock() {
+  try {
+    await wakeLock?.release();
+  } catch {
+    /* 무시 */
+  }
+  wakeLock = null;
+}
+const wakeLockSupported = () => 'wakeLock' in navigator;
 
 // ===== 설정 저장/복원 =====
 function loadSettings() {
@@ -228,12 +253,15 @@ async function startBgOcr() {
   bg.total = state.total;
   bg.done = 0;
   bg.failed = 0;
+  bg.nextPage = 1;
   els.btnBgocr.classList.add('active');
   els.btnBgocr.textContent = '⏸';
   els.btnBgocr.title = '배경 인식 중지';
+  await acquireWakeLock(); // 화면이 꺼지지 않게 (사용자 제스처 컨텍스트)
   updateBgUI();
 
   for (let p = 1; p <= state.total; p++) {
+    bg.nextPage = p; // 중단 시 재개 지점
     if (!bg.active || bg.fileKey !== state.fileKey) break; // 중지/파일 변경 시 종료
 
     if (await getOcr(bg.fileKey, bg.lang, p)) {
@@ -274,6 +302,7 @@ async function startBgOcr() {
 
   const finished = bg.active;
   bg.active = false;
+  await releaseWakeLock();
   els.btnBgocr.classList.remove('active');
   els.btnBgocr.textContent = '⚡';
   els.btnBgocr.title = '전체 페이지 배경 인식 (나중에 즉시 열람)';
@@ -283,6 +312,7 @@ async function startBgOcr() {
 
 function stopBgOcr() {
   bg.active = false;
+  releaseWakeLock();
 }
 
 function updateBgUI() {
@@ -294,7 +324,9 @@ function updateBgUI() {
   const pct = bg.total ? Math.round((bg.done / bg.total) * 100) : 0;
   els.bgStatus.hidden = false;
   els.bgStatus.classList.remove('done');
-  els.bgStatusText.textContent = `배경 인식 ${bg.done}/${bg.total}쪽 (${pct}%)`;
+  // 화면 잠금 방지 상태를 함께 안내 (iOS는 화면이 꺼지면 인식이 멈춤)
+  const hint = wakeLock ? ' · 화면 유지 중' : wakeLockSupported() ? '' : ' · 화면 켜 두세요';
+  els.bgStatusText.textContent = `배경 인식 ${bg.done}/${bg.total}쪽 (${pct}%)${hint}`;
 }
 
 function showBgDone() {
@@ -513,6 +545,12 @@ function bindEvents() {
     showUI();
     if (bg.active) stopBgOcr();
     else startBgOcr();
+  });
+
+  // 앱이 다시 포그라운드로 돌아오면(잠금 해제/앱 복귀) 화면 잠금 방지를 재획득.
+  // iOS는 백그라운드 동안 JS를 멈추므로, 복귀 시 배경 인식 루프가 이어서 진행된다.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && bg.active && !wakeLock) acquireWakeLock();
   });
 
   // 글자 크기 단축 버튼
