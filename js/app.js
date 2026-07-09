@@ -8,7 +8,7 @@ import {
   showSubPage,
   applySettings,
 } from './reader.js';
-import { hasMeaningfulText, ocrPage } from './ocr.js';
+import { hasMeaningfulText, ocrPage, ocrConcurrency, resetOcr } from './ocr.js';
 import { getOcr, putOcr, countOcr } from './store.js';
 import { initTranslate } from './translate.js';
 
@@ -243,8 +243,27 @@ async function getPageContent(pageNum) {
 }
 
 // ===== 배경 일괄 OCR =====
-// 문서 전체를 순서대로 인식해 IndexedDB에 저장해 둔다. 이미 저장된 페이지·
-// 텍스트 페이지는 건너뛰고, 사용자가 보는 페이지(전경)에는 워커 우선권을 양보한다.
+// 문서 전체를 인식해 IndexedDB에 저장해 둔다. 여러 워커로 병렬 처리하되,
+// 이미 저장된 페이지·텍스트 페이지는 건너뛰고, 보는 페이지(전경)에는 우선권을 양보한다.
+async function processBgPage(p) {
+  if (!bg.active || bg.fileKey !== state.fileKey) return;
+  if (await getOcr(bg.fileKey, bg.lang, p)) return; // 이미 인식됨
+  const page = await state.pdf.getPage(p);
+  try {
+    const tc = await page.getTextContent();
+    if (hasMeaningfulText(tc)) return; // 텍스트 페이지 → OCR 불필요
+    const ocr = await ocrPage(page, bg.lang, null, { priority: false });
+    if (!bg.active || bg.fileKey !== state.fileKey) return;
+    await putOcr(bg.fileKey, bg.lang, p, ocr);
+    // 지금 보고 있는 페이지가 방금 인식됐다면 즉시 반영
+    if (state.page === p && state.mode === 'reader' && !state.contentCache.has(p)) {
+      showPage(p, { keepSub: true });
+    }
+  } finally {
+    page.cleanup();
+  }
+}
+
 async function startBgOcr() {
   if (bg.active || !state.pdf) return;
   bg.active = true;
@@ -253,52 +272,48 @@ async function startBgOcr() {
   bg.total = state.total;
   bg.done = 0;
   bg.failed = 0;
-  bg.nextPage = 1;
   els.btnBgocr.classList.add('active');
   els.btnBgocr.textContent = '⏸';
   els.btnBgocr.title = '배경 인식 중지';
   await acquireWakeLock(); // 화면이 꺼지지 않게 (사용자 제스처 컨텍스트)
   updateBgUI();
 
-  for (let p = 1; p <= state.total; p++) {
-    bg.nextPage = p; // 중단 시 재개 지점
-    if (!bg.active || bg.fileKey !== state.fileKey) break; // 중지/파일 변경 시 종료
-
-    if (await getOcr(bg.fileKey, bg.lang, p)) {
-      bg.done++;
-      updateBgUI();
-      continue; // 이미 인식됨
-    }
-    try {
-      const page = await state.pdf.getPage(p);
-      try {
-        const tc = await page.getTextContent();
-        if (hasMeaningfulText(tc)) {
-          bg.done++; // 텍스트 페이지는 OCR 불필요
-        } else {
-          const ocr = await ocrPage(page, bg.lang, null, { priority: false });
-          if (!bg.active || bg.fileKey !== state.fileKey) {
-            page.cleanup();
-            break;
-          }
-          await putOcr(bg.fileKey, bg.lang, p, ocr);
-          bg.done++;
-          // 지금 보고 있는 페이지가 방금 인식됐다면 즉시 반영
-          if (state.page === p && state.mode === 'reader' && !state.contentCache.has(p)) {
-            showPage(p, { keepSub: true });
-          }
-        }
-      } finally {
-        page.cleanup();
+  // 동시에 최대 conc개 페이지를 처리 (기기 성능에 맞춘 워커 수)
+  const conc = Math.max(1, ocrConcurrency());
+  let next = 1;
+  const running = new Set();
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (!done) {
+        done = true;
+        resolve();
       }
-    } catch (err) {
-      console.warn('배경 OCR 실패 p' + p, err);
-      bg.failed++;
-      bg.done++;
-    }
-    updateBgUI();
-    await new Promise((r) => setTimeout(r, 20)); // UI에 숨 돌릴 틈
-  }
+    };
+    const pump = () => {
+      if (!bg.active || bg.fileKey !== state.fileKey) {
+        if (running.size === 0) finish();
+        return;
+      }
+      while (next <= state.total && running.size < conc) {
+        const p = next++;
+        const job = processBgPage(p)
+          .catch((err) => {
+            console.warn('배경 OCR 실패 p' + p, err);
+            bg.failed++;
+          })
+          .finally(() => {
+            running.delete(job);
+            bg.done++;
+            updateBgUI();
+            pump();
+          });
+        running.add(job);
+      }
+      if (running.size === 0 && next > state.total) finish();
+    };
+    pump();
+  });
 
   const finished = bg.active;
   bg.active = false;
@@ -611,6 +626,7 @@ function bindSettingsControls() {
     state.settings.ocrLang = e.target.value;
     saveSettings();
     stopBgOcr(); // 언어가 바뀌면 진행 중인 배경 인식 중지 (결과 키가 달라짐)
+    resetOcr(e.target.value); // 워커 풀을 새 언어로 재구성
     // 언어가 바뀌면 기존 OCR 결과 무효화
     for (const [k, v] of state.contentCache) {
       if (v.source === 'ocr') state.contentCache.delete(k);
