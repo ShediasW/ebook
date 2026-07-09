@@ -1,7 +1,15 @@
 // 텍스트 레이어 유무 판별 + 스캔(이미지) PDF의 Tesseract.js OCR 처리
 
 const TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-const OCR_TARGET_WIDTH = 1800; // OCR 정확도를 위한 렌더링 해상도(px)
+
+// OCR 렌더링 해상도: 정확도와 순간 메모리의 균형. 저사양·모바일에서는 낮춘다.
+function ocrTargetWidth() {
+  const mem = navigator.deviceMemory || 4; // GB (미지원 시 4로 가정)
+  const coarse = window.matchMedia?.('(pointer: coarse)').matches; // 터치(모바일) 기기
+  if (mem <= 2) return 1200;
+  if (coarse || mem <= 4) return 1500;
+  return 1800;
+}
 
 // CDN 대신 자체 호스팅 파일을 쓰려면 window.EBOOK_TESSERACT_OPTS에
 // { scriptPath, workerPath, corePath, langPath }를 지정하면 된다.
@@ -65,16 +73,25 @@ async function getWorker(lang, onProgress) {
 // 반환: { paragraphs: [{text, heading}], words: [{text, bbox}], width, height }
 export async function ocrPage(pdfPage, lang, onProgress) {
   const base = pdfPage.getViewport({ scale: 1 });
-  const scale = Math.min(3, Math.max(1.5, OCR_TARGET_WIDTH / base.width));
+  const scale = Math.min(3, Math.max(1.2, ocrTargetWidth() / base.width));
   const viewport = pdfPage.getViewport({ scale });
 
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.floor(viewport.width);
-  canvas.height = Math.floor(viewport.height);
-  await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  let canvas = document.createElement('canvas');
+  const cw = Math.floor(viewport.width);
+  const ch = Math.floor(viewport.height);
+  canvas.width = cw;
+  canvas.height = ch;
 
-  const w = await getWorker(lang, onProgress);
-  const { data } = await w.recognize(canvas);
+  let data;
+  try {
+    await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    const w = await getWorker(lang, onProgress);
+    ({ data } = await w.recognize(canvas));
+  } finally {
+    // 고해상도 캔버스(수십 MB)를 즉시 반납 — 페이지 이동을 반복해도 누적되지 않도록
+    canvas.width = canvas.height = 0;
+    canvas = null;
+  }
 
   const paragraphs = (data.paragraphs?.length
     ? data.paragraphs.map((p) => p.text)
@@ -88,5 +105,5 @@ export async function ocrPage(pdfPage, lang, onProgress) {
     .filter((wd) => wd.text?.trim())
     .map((wd) => ({ text: wd.text, bbox: wd.bbox }));
 
-  return { paragraphs, words, width: canvas.width, height: canvas.height };
+  return { paragraphs, words, width: cw, height: ch };
 }

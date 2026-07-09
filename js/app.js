@@ -9,7 +9,10 @@ import {
   applySettings,
 } from './reader.js';
 import { hasMeaningfulText, ocrPage } from './ocr.js';
+import { getOcr, putOcr } from './store.js';
 import { initTranslate } from './translate.js';
+
+const CACHE_CAP = 30; // 메모리에 유지할 페이지 수 (초과분은 오래된 것부터 제거)
 
 const $ = (id) => document.getElementById(id);
 
@@ -110,10 +113,21 @@ async function openFile(file) {
     alert('PDF 파일만 열 수 있습니다.');
     return;
   }
-  showLoading('PDF 여는 중…');
+  const bigMB = Math.round(file.size / (1024 * 1024));
+  const isLarge = file.size > 150 * 1024 * 1024;
+  showLoading(isLarge ? `대용량 PDF 여는 중… (${bigMB}MB, 스트리밍)` : 'PDF 여는 중…');
   try {
-    const buf = await file.arrayBuffer();
-    const pdf = await openDocument(buf);
+    // 이전 문서의 워커·버퍼를 먼저 해제해 메모리를 회수
+    if (state.pdf) {
+      try {
+        await state.pdf.destroy();
+      } catch {
+        /* 무시 */
+      }
+      state.pdf = null;
+    }
+    // 파일을 통째로 읽지 않고 File 객체를 그대로 넘겨 range 스트리밍으로 연다
+    const pdf = await openDocument(file);
     state.pdf = pdf;
     state.total = pdf.numPages;
     state.fileKey = `${file.name}:${file.size}`;
@@ -141,26 +155,46 @@ async function openFile(file) {
 
 // ===== 페이지 내용 추출 (텍스트 레이어 우선, 없으면 OCR) =====
 async function getPageContent(pageNum) {
-  if (state.contentCache.has(pageNum)) return state.contentCache.get(pageNum);
-
-  const page = await state.pdf.getPage(pageNum);
-  const textContent = await page.getTextContent();
-  let content;
-  if (hasMeaningfulText(textContent)) {
-    content = { source: 'text', paragraphs: buildParagraphs(textContent) };
-  } else {
-    // 이미지(스캔) 페이지 → OCR
-    try {
-      const ocr = await ocrPage(page, state.settings.ocrLang, (p) =>
-        showLoading(p.status, p.progress)
-      );
-      content = { source: 'ocr', ...ocr };
-    } catch (err) {
-      console.warn('OCR 실패:', err);
-      content = { source: 'ocr', paragraphs: [], words: [], ocrFailed: true };
-    }
+  const cached = state.contentCache.get(pageNum);
+  if (cached) {
+    // LRU: 최근 사용 항목을 맨 뒤로 이동
+    state.contentCache.delete(pageNum);
+    state.contentCache.set(pageNum, cached);
+    return cached;
   }
+
+  const lang = state.settings.ocrLang;
+  const page = await state.pdf.getPage(pageNum);
+  let content;
+  try {
+    const textContent = await page.getTextContent();
+    if (hasMeaningfulText(textContent)) {
+      content = { source: 'text', paragraphs: buildParagraphs(textContent) };
+    } else {
+      // 이미지(스캔) 페이지 → 먼저 영구 캐시(IndexedDB) 확인
+      const saved = await getOcr(state.fileKey, lang, pageNum);
+      if (saved) {
+        content = { source: 'ocr', ...saved };
+      } else {
+        try {
+          const ocr = await ocrPage(page, lang, (p) => showLoading(p.status, p.progress));
+          content = { source: 'ocr', ...ocr };
+          putOcr(state.fileKey, lang, pageNum, ocr); // 다음 방문/재접속용으로 저장
+        } catch (err) {
+          console.warn('OCR 실패:', err);
+          content = { source: 'ocr', paragraphs: [], words: [], ocrFailed: true };
+        }
+      }
+    }
+  } finally {
+    page.cleanup(); // 페이지 내부 캐시 해제
+  }
+
   state.contentCache.set(pageNum, content);
+  // 캐시 상한 초과 시 가장 오래된 항목부터 제거 (장문 문서 메모리 억제)
+  while (state.contentCache.size > CACHE_CAP) {
+    state.contentCache.delete(state.contentCache.keys().next().value);
+  }
   return content;
 }
 
