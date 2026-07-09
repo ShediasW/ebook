@@ -9,7 +9,7 @@ import {
   applySettings,
 } from './reader.js';
 import { hasMeaningfulText, ocrPage } from './ocr.js';
-import { getOcr, putOcr } from './store.js';
+import { getOcr, putOcr, countOcr } from './store.js';
 import { initTranslate } from './translate.js';
 
 const CACHE_CAP = 30; // 메모리에 유지할 페이지 수 (초과분은 오래된 것부터 제거)
@@ -42,6 +42,9 @@ const els = {
   btnPrev: $('btn-prev'),
   btnNext: $('btn-next'),
   btnMode: $('btn-mode'),
+  btnBgocr: $('btn-bgocr'),
+  bgStatus: $('bg-status'),
+  bgStatusText: $('bg-status-text'),
   settingsPanel: $('settings-panel'),
   translateBtn: $('translate-btn'),
   translatePopup: $('translate-popup'),
@@ -70,7 +73,11 @@ const state = {
   contentCache: new Map(), // page -> { source, paragraphs, words?, width?, height? }
   settings: loadSettings(),
   renderSeq: 0,
+  hasImagePages: false, // 이미지(OCR 필요) 페이지가 있는 문서인지
 };
+
+// 배경 일괄 OCR 상태
+const bg = { active: false, fileKey: null, lang: null, done: 0, total: 0, failed: 0 };
 
 // ===== 설정 저장/복원 =====
 function loadSettings() {
@@ -116,6 +123,12 @@ async function openFile(file) {
   const bigMB = Math.round(file.size / (1024 * 1024));
   const isLarge = file.size > 150 * 1024 * 1024;
   showLoading(isLarge ? `대용량 PDF 여는 중… (${bigMB}MB, 스트리밍)` : 'PDF 여는 중…');
+  stopBgOcr(); // 진행 중이던 배경 인식 중지 (새 문서)
+  els.btnBgocr.hidden = true;
+  els.btnBgocr.classList.remove('active');
+  els.btnBgocr.textContent = '⚡';
+  els.bgStatus.hidden = true;
+  state.hasImagePages = false;
   try {
     // 이전 문서의 워커·버퍼를 먼저 해제해 메모리를 회수
     if (state.pdf) {
@@ -190,12 +203,122 @@ async function getPageContent(pageNum) {
     page.cleanup(); // 페이지 내부 캐시 해제
   }
 
+  if (content.source === 'ocr' && !state.hasImagePages) {
+    state.hasImagePages = true;
+    els.btnBgocr.hidden = false; // 이미지 문서 → 배경 인식 버튼 노출
+    refreshBgIdleStatus();
+  }
+
   state.contentCache.set(pageNum, content);
   // 캐시 상한 초과 시 가장 오래된 항목부터 제거 (장문 문서 메모리 억제)
   while (state.contentCache.size > CACHE_CAP) {
     state.contentCache.delete(state.contentCache.keys().next().value);
   }
   return content;
+}
+
+// ===== 배경 일괄 OCR =====
+// 문서 전체를 순서대로 인식해 IndexedDB에 저장해 둔다. 이미 저장된 페이지·
+// 텍스트 페이지는 건너뛰고, 사용자가 보는 페이지(전경)에는 워커 우선권을 양보한다.
+async function startBgOcr() {
+  if (bg.active || !state.pdf) return;
+  bg.active = true;
+  bg.fileKey = state.fileKey;
+  bg.lang = state.settings.ocrLang;
+  bg.total = state.total;
+  bg.done = 0;
+  bg.failed = 0;
+  els.btnBgocr.classList.add('active');
+  els.btnBgocr.textContent = '⏸';
+  els.btnBgocr.title = '배경 인식 중지';
+  updateBgUI();
+
+  for (let p = 1; p <= state.total; p++) {
+    if (!bg.active || bg.fileKey !== state.fileKey) break; // 중지/파일 변경 시 종료
+
+    if (await getOcr(bg.fileKey, bg.lang, p)) {
+      bg.done++;
+      updateBgUI();
+      continue; // 이미 인식됨
+    }
+    try {
+      const page = await state.pdf.getPage(p);
+      try {
+        const tc = await page.getTextContent();
+        if (hasMeaningfulText(tc)) {
+          bg.done++; // 텍스트 페이지는 OCR 불필요
+        } else {
+          const ocr = await ocrPage(page, bg.lang, null, { priority: false });
+          if (!bg.active || bg.fileKey !== state.fileKey) {
+            page.cleanup();
+            break;
+          }
+          await putOcr(bg.fileKey, bg.lang, p, ocr);
+          bg.done++;
+          // 지금 보고 있는 페이지가 방금 인식됐다면 즉시 반영
+          if (state.page === p && state.mode === 'reader' && !state.contentCache.has(p)) {
+            showPage(p, { keepSub: true });
+          }
+        }
+      } finally {
+        page.cleanup();
+      }
+    } catch (err) {
+      console.warn('배경 OCR 실패 p' + p, err);
+      bg.failed++;
+      bg.done++;
+    }
+    updateBgUI();
+    await new Promise((r) => setTimeout(r, 20)); // UI에 숨 돌릴 틈
+  }
+
+  const finished = bg.active;
+  bg.active = false;
+  els.btnBgocr.classList.remove('active');
+  els.btnBgocr.textContent = '⚡';
+  els.btnBgocr.title = '전체 페이지 배경 인식 (나중에 즉시 열람)';
+  if (finished && bg.fileKey === state.fileKey) showBgDone();
+  else updateBgUI();
+}
+
+function stopBgOcr() {
+  bg.active = false;
+}
+
+function updateBgUI() {
+  if (!bg.active) {
+    if (bg.fileKey === state.fileKey) return; // showBgDone/refreshBgIdleStatus가 처리
+    els.bgStatus.hidden = true;
+    return;
+  }
+  const pct = bg.total ? Math.round((bg.done / bg.total) * 100) : 0;
+  els.bgStatus.hidden = false;
+  els.bgStatus.classList.remove('done');
+  els.bgStatusText.textContent = `배경 인식 ${bg.done}/${bg.total}쪽 (${pct}%)`;
+}
+
+function showBgDone() {
+  els.bgStatus.hidden = false;
+  els.bgStatus.classList.add('done');
+  const failNote = bg.failed ? ` (${bg.failed}쪽 실패)` : '';
+  els.bgStatusText.textContent = `전체 인식 완료 · ${bg.total}쪽${failNote}`;
+  setTimeout(() => {
+    if (!bg.active) els.bgStatus.hidden = true;
+  }, 4000);
+}
+
+// 문서를 열었을 때, 이미 저장돼 있는 인식 진행 상황을 잠깐 안내
+async function refreshBgIdleStatus() {
+  if (bg.active || !state.hasImagePages) return;
+  const done = await countOcr(state.fileKey, state.settings.ocrLang);
+  if (done > 0 && !bg.active) {
+    els.bgStatus.hidden = false;
+    els.bgStatus.classList.add('done');
+    els.bgStatusText.textContent = `${done}/${state.total}쪽 인식됨 · ⚡로 나머지 인식`;
+    setTimeout(() => {
+      if (!bg.active) els.bgStatus.hidden = true;
+    }, 4500);
+  }
 }
 
 // ===== 페이지 표시 =====
@@ -385,6 +508,13 @@ function bindEvents() {
     showPage(state.page);
   });
 
+  // 배경 일괄 인식 시작/중지
+  els.btnBgocr.addEventListener('click', () => {
+    showUI();
+    if (bg.active) stopBgOcr();
+    else startBgOcr();
+  });
+
   // 글자 크기 단축 버튼
   $('btn-font-plus').addEventListener('click', () => changeFontSize(1));
   $('btn-font-minus').addEventListener('click', () => changeFontSize(-1));
@@ -442,10 +572,12 @@ function bindSettingsControls() {
   $('set-ocr-lang').addEventListener('change', (e) => {
     state.settings.ocrLang = e.target.value;
     saveSettings();
+    stopBgOcr(); // 언어가 바뀌면 진행 중인 배경 인식 중지 (결과 키가 달라짐)
     // 언어가 바뀌면 기존 OCR 결과 무효화
     for (const [k, v] of state.contentCache) {
       if (v.source === 'ocr') state.contentCache.delete(k);
     }
+    if (state.mode === 'reader' && state.contentCache.size === 0) showPage(state.page, { keepSub: true });
   });
 }
 
