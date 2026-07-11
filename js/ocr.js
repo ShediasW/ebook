@@ -1,4 +1,8 @@
-// 텍스트 레이어 유무 판별 + 스캔(이미지) PDF의 Tesseract.js OCR 처리
+// OCR 디스패처: 엔진(기기 내 Tesseract / 클라우드 CLOVA·Google Vision) 선택,
+// 텍스트 레이어 유무 판별, 우선순위 큐, 전처리·후처리
+
+import { cloudOcrPage } from './ocr-cloud.js';
+import { tidySpacing, fixTesseractKoreanSpacing } from './postprocess.js';
 
 const TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
 
@@ -145,44 +149,148 @@ export async function resetOcr(lang) {
   }
 }
 
-// 페이지를 고해상도 캔버스로 렌더링한 뒤 OCR 실행 (워커 풀 경유)
-// opts.priority=false 이면 배경 작업으로 취급해 전경 요청에 양보한다.
-// 반환: { paragraphs: [{text, heading}], words: [{text, bbox}], width, height }
-export function ocrPage(pdfPage, lang, onProgress, opts = {}) {
-  const priority = opts.priority !== false; // 기본: 전경(우선)
-  if (poolLang && poolLang !== lang) resetOcr(lang); // 언어 변경 감지
-  poolLang = lang;
-  return enqueueOcr(priority, onProgress, (w) => ocrPageNow(pdfPage, w));
-}
-
-async function ocrPageNow(pdfPage, w) {
+// ── 공통: 페이지 → OCR 입력 캔버스 ───────────────────────────
+async function renderPageCanvas(pdfPage) {
   const base = pdfPage.getViewport({ scale: 1 });
   const scale = Math.min(3, Math.max(1.2, ocrTargetWidth() / base.width));
   const viewport = pdfPage.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  return canvas;
+}
 
-  let canvas = document.createElement('canvas');
-  const cw = Math.floor(viewport.width);
-  const ch = Math.floor(viewport.height);
-  canvas.width = cw;
-  canvas.height = ch;
+// 고해상도 캔버스(수십 MB)를 즉시 반납 — 페이지 이동을 반복해도 누적되지 않도록
+function disposeCanvas(canvas) {
+  if (canvas) canvas.width = canvas.height = 0;
+}
+
+// Tesseract 전처리: 그레이스케일 + Otsu 이진화 (스캔 대비 개선 → 인식률 향상)
+function binarize(canvas) {
+  const ctx = canvas.getContext('2d');
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < d.length; i += 4) {
+    const g = ((d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000) | 0;
+    d[i] = g;
+    hist[g]++;
+  }
+  const total = d.length / 4;
+  let sum = 0;
+  for (let t = 0; t < 256; t++) sum += t * hist[t];
+  let sumB = 0, wB = 0, maxVar = 0, thr = 127;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (!wB) continue;
+    const wF = total - wB;
+    if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > maxVar) {
+      maxVar = v;
+      thr = t;
+    }
+  }
+  for (let i = 0; i < d.length; i += 4) {
+    const v = d[i] > thr ? 255 : 0;
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// ── 클라우드 엔진용 소형 큐 (동시 2건 — API 한도 보호) ────────
+const cloudQueue = [];
+let cloudActive = 0;
+const CLOUD_CONC = 2;
+
+function pumpCloud() {
+  while (cloudActive < CLOUD_CONC && cloudQueue.length) {
+    const t = cloudQueue.shift();
+    cloudActive++;
+    (async () => {
+      try {
+        t.resolve(await t.job());
+      } catch (err) {
+        t.reject(err);
+      } finally {
+        cloudActive--;
+        pumpCloud();
+      }
+    })();
+  }
+}
+
+function enqueueCloud(priority, job) {
+  return new Promise((resolve, reject) => {
+    const item = { priority, job, resolve, reject };
+    if (priority) {
+      const idx = cloudQueue.findIndex((q) => !q.priority);
+      if (idx === -1) cloudQueue.push(item);
+      else cloudQueue.splice(idx, 0, item);
+    } else {
+      cloudQueue.push(item);
+    }
+    pumpCloud();
+  });
+}
+
+// 페이지를 렌더링한 뒤 선택된 엔진으로 OCR 실행 (우선순위 큐 경유)
+// opts: { priority?: boolean, engine?: 'tesseract'|'clova'|'gvision', cloudCfg?: object }
+// 반환: { paragraphs: [{text, heading}], words: [{text, bbox}], width, height }
+export function ocrPage(pdfPage, lang, onProgress, opts = {}) {
+  const priority = opts.priority !== false; // 기본: 전경(우선)
+  const engine = opts.engine || 'tesseract';
+
+  if (engine === 'clova' || engine === 'gvision') {
+    return enqueueCloud(priority, async () => {
+      onProgress?.({ status: '클라우드로 전송 중…', progress: 0.4 });
+      let canvas = await renderPageCanvas(pdfPage);
+      try {
+        const result = await cloudOcrPage(engine, canvas, opts.cloudCfg || {}, lang);
+        onProgress?.({ status: '클라우드 인식 완료', progress: 1 });
+        return result;
+      } finally {
+        disposeCanvas(canvas);
+        canvas = null;
+      }
+    });
+  }
+
+  if (poolLang && poolLang !== lang) resetOcr(lang); // 언어 변경 감지
+  poolLang = lang;
+  return enqueueOcr(priority, onProgress, (w) => ocrPageNow(pdfPage, w, lang));
+}
+
+async function ocrPageNow(pdfPage, w, lang) {
+  let canvas = await renderPageCanvas(pdfPage);
+  const cw = canvas.width;
+  const ch = canvas.height;
 
   let data;
   try {
-    await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    binarize(canvas);
     ({ data } = await w.recognize(canvas));
   } finally {
-    // 고해상도 캔버스(수십 MB)를 즉시 반납 — 페이지 이동을 반복해도 누적되지 않도록
-    canvas.width = canvas.height = 0;
+    disposeCanvas(canvas);
     canvas = null;
   }
 
+  const isKorean = /kor/.test(lang || '');
   const paragraphs = (data.paragraphs?.length
     ? data.paragraphs.map((p) => p.text)
     : (data.text || '').split(/\n\s*\n/)
   )
     .map((t) => t.replace(/-\n(?=[a-z])/g, '').replace(/\s+/g, ' ').trim())
     .filter(Boolean)
-    .map((text) => ({ text, heading: false }));
+    .map((text) => ({
+      text: isKorean ? fixTesseractKoreanSpacing(text) : tidySpacing(text),
+      heading: false,
+    }))
+    .filter((p) => p.text);
 
   const words = (data.words || [])
     .filter((wd) => wd.text?.trim())
