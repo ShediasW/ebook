@@ -485,6 +485,22 @@ body.ui-hidden .nav-zone span { opacity: 0; }
   font-size: 14px;
 }
 
+.cloud-keys { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.cloud-keys input {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--page-bg);
+  color: var(--text);
+  font-size: 13px;
+}
+.cloud-key-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.key-test-result { font-size: 12px; color: var(--text-dim); }
+.key-test-result.ok { color: #3fae6a; }
+.key-test-result.bad { color: #d0453e; }
+.keys-note { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin: 8px 0 0; }
+
 .theme-buttons { display: flex; gap: 8px; }
 .theme-btn {
   flex: 1;

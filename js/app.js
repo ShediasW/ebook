@@ -9,6 +9,7 @@ import {
   applySettings,
 } from './reader.js';
 import { hasMeaningfulText, ocrPage, ocrConcurrency, resetOcr } from './ocr.js';
+import { cloudOcrPage, CloudOcrError } from './ocr-cloud.js';
 import { getOcr, putOcr, countOcr } from './store.js';
 import { initTranslate } from './translate.js';
 
@@ -60,6 +61,10 @@ const DEFAULT_SETTINGS = {
   lineHeight: 1.8,
   maxWidth: 680,
   ocrLang: 'eng+kor',
+  ocrEngine: 'tesseract', // 'tesseract' | 'clova' | 'gvision'
+  clovaUrl: '',
+  clovaSecret: '',
+  gvisionKey: '',
 };
 
 const state = {
@@ -77,7 +82,28 @@ const state = {
 };
 
 // 배경 일괄 OCR 상태
-const bg = { active: false, fileKey: null, lang: null, done: 0, total: 0, failed: 0, nextPage: 1 };
+const bg = { active: false, fileKey: null, lang: null, engine: null, cloudCfg: null, done: 0, total: 0, failed: 0 };
+
+// ── 엔진 관련 헬퍼 ───────────────────────────────────────────
+// IndexedDB 캐시 키의 언어 자리: tesseract는 기존 형식 유지(하위 호환),
+// 클라우드는 엔진을 붙여 결과를 분리 저장한다.
+function engineLang(engine = state.settings.ocrEngine) {
+  return engine === 'tesseract'
+    ? state.settings.ocrLang
+    : `${engine}:${state.settings.ocrLang}`;
+}
+function cloudCfg(engine = state.settings.ocrEngine) {
+  if (engine === 'clova') return { url: state.settings.clovaUrl, secret: state.settings.clovaSecret };
+  if (engine === 'gvision') return { key: state.settings.gvisionKey };
+  return null;
+}
+// 클라우드 오류는 종류별로 세션당 1회만 알림 (페이지마다 반복 알림 방지)
+const cloudNotified = new Set();
+function notifyCloudError(err) {
+  if (cloudNotified.has(err.kind)) return;
+  cloudNotified.add(err.kind);
+  alert(`클라우드 OCR 오류: ${err.message}\n\n이 세션에서는 기기 내 인식(Tesseract)으로 대신 처리합니다. 설정(⚙)에서 키를 확인해 주세요.`);
+}
 
 // 화면 꺼짐 방지 (Wake Lock): 배경 인식 중 화면이 자동으로 잠기지 않게 유지.
 // iOS는 백그라운드로 가면 JS를 멈추므로 "화면을 켜 둔 채" 두는 것이 최선이다.
@@ -202,6 +228,7 @@ async function getPageContent(pageNum) {
   }
 
   const lang = state.settings.ocrLang;
+  const engine = state.settings.ocrEngine;
   const page = await state.pdf.getPage(pageNum);
   let content;
   try {
@@ -210,17 +237,36 @@ async function getPageContent(pageNum) {
       content = { source: 'text', paragraphs: buildParagraphs(textContent) };
     } else {
       // 이미지(스캔) 페이지 → 먼저 영구 캐시(IndexedDB) 확인
-      const saved = await getOcr(state.fileKey, lang, pageNum);
+      const saved = await getOcr(state.fileKey, engineLang(engine), pageNum);
       if (saved) {
         content = { source: 'ocr', ...saved };
       } else {
         try {
-          const ocr = await ocrPage(page, lang, (p) => showLoading(p.status, p.progress));
+          const ocr = await ocrPage(page, lang, (p) => showLoading(p.status, p.progress), {
+            engine,
+            cloudCfg: cloudCfg(engine),
+          });
           content = { source: 'ocr', ...ocr };
-          putOcr(state.fileKey, lang, pageNum, ocr); // 다음 방문/재접속용으로 저장
+          putOcr(state.fileKey, engineLang(engine), pageNum, ocr); // 다음 방문/재접속용으로 저장
         } catch (err) {
-          console.warn('OCR 실패:', err);
-          content = { source: 'ocr', paragraphs: [], words: [], ocrFailed: true };
+          if (err instanceof CloudOcrError) {
+            // 클라우드 실패(키/한도/차단) → 안내 후 기기 내 인식으로 폴백
+            console.warn('클라우드 OCR 실패, Tesseract 폴백:', err.kind, err.message);
+            notifyCloudError(err);
+            try {
+              const ocr = await ocrPage(page, lang, (p) => showLoading(p.status, p.progress), {
+                engine: 'tesseract',
+              });
+              content = { source: 'ocr', ...ocr };
+              putOcr(state.fileKey, engineLang('tesseract'), pageNum, ocr);
+            } catch (err2) {
+              console.warn('OCR 실패:', err2);
+              content = { source: 'ocr', paragraphs: [], words: [], ocrFailed: true };
+            }
+          } else {
+            console.warn('OCR 실패:', err);
+            content = { source: 'ocr', paragraphs: [], words: [], ocrFailed: true };
+          }
         }
       }
     }
@@ -247,14 +293,18 @@ async function getPageContent(pageNum) {
 // 이미 저장된 페이지·텍스트 페이지는 건너뛰고, 보는 페이지(전경)에는 우선권을 양보한다.
 async function processBgPage(p) {
   if (!bg.active || bg.fileKey !== state.fileKey) return;
-  if (await getOcr(bg.fileKey, bg.lang, p)) return; // 이미 인식됨
+  if (await getOcr(bg.fileKey, bg.storeLang, p)) return; // 이미 인식됨
   const page = await state.pdf.getPage(p);
   try {
     const tc = await page.getTextContent();
     if (hasMeaningfulText(tc)) return; // 텍스트 페이지 → OCR 불필요
-    const ocr = await ocrPage(page, bg.lang, null, { priority: false });
+    const ocr = await ocrPage(page, bg.lang, null, {
+      priority: false,
+      engine: bg.engine,
+      cloudCfg: bg.cloudCfg,
+    });
     if (!bg.active || bg.fileKey !== state.fileKey) return;
-    await putOcr(bg.fileKey, bg.lang, p, ocr);
+    await putOcr(bg.fileKey, bg.storeLang, p, ocr);
     // 지금 보고 있는 페이지가 방금 인식됐다면 즉시 반영
     if (state.page === p && state.mode === 'reader' && !state.contentCache.has(p)) {
       showPage(p, { keepSub: true });
@@ -266,9 +316,32 @@ async function processBgPage(p) {
 
 async function startBgOcr() {
   if (bg.active || !state.pdf) return;
+  const engine = state.settings.ocrEngine;
+
+  // 클라우드 엔진은 호출량 = 요금 → 실행 전 예상 비용 확인
+  if (engine !== 'tesseract') {
+    const already = await countOcr(state.fileKey, engineLang(engine));
+    const remain = Math.max(0, state.total - already);
+    const est =
+      engine === 'clova'
+        ? `약 ${(remain * 3).toLocaleString()}원 이내`
+        : `약 $${(remain * 0.0015).toFixed(2)} 이내`;
+    const label = engine === 'clova' ? 'CLOVA OCR' : 'Google Vision';
+    if (
+      !confirm(
+        `미인식 최대 ${remain}쪽을 ${label}(클라우드)로 인식합니다.\n` +
+          `예상 요금: ${est} (텍스트 페이지·이미 인식된 쪽은 과금되지 않음)\n\n계속할까요?`
+      )
+    )
+      return;
+  }
+
   bg.active = true;
   bg.fileKey = state.fileKey;
   bg.lang = state.settings.ocrLang;
+  bg.engine = engine;
+  bg.cloudCfg = cloudCfg(engine);
+  bg.storeLang = engineLang(engine);
   bg.total = state.total;
   bg.done = 0;
   bg.failed = 0;
@@ -278,8 +351,8 @@ async function startBgOcr() {
   await acquireWakeLock(); // 화면이 꺼지지 않게 (사용자 제스처 컨텍스트)
   updateBgUI();
 
-  // 동시에 최대 conc개 페이지를 처리 (기기 성능에 맞춘 워커 수)
-  const conc = Math.max(1, ocrConcurrency());
+  // 동시 처리 수: 기기 내 인식은 워커 수, 클라우드는 API 한도 보호를 위해 2
+  const conc = engine === 'tesseract' ? Math.max(1, ocrConcurrency()) : 2;
   let next = 1;
   const running = new Set();
   await new Promise((resolve) => {
@@ -301,6 +374,11 @@ async function startBgOcr() {
           .catch((err) => {
             console.warn('배경 OCR 실패 p' + p, err);
             bg.failed++;
+            // 키·한도·차단 오류는 계속해봐야 전부 실패(과금 위험) → 즉시 중지
+            if (err instanceof CloudOcrError && err.kind !== 'response') {
+              notifyCloudError(err);
+              bg.active = false;
+            }
           })
           .finally(() => {
             running.delete(job);
@@ -357,7 +435,7 @@ function showBgDone() {
 // 문서를 열었을 때, 이미 저장돼 있는 인식 진행 상황을 잠깐 안내
 async function refreshBgIdleStatus() {
   if (bg.active || !state.hasImagePages) return;
-  const done = await countOcr(state.fileKey, state.settings.ocrLang);
+  const done = await countOcr(state.fileKey, engineLang());
   if (done > 0 && !bg.active) {
     els.bgStatus.hidden = false;
     els.bgStatus.classList.add('done');
@@ -627,12 +705,64 @@ function bindSettingsControls() {
     saveSettings();
     stopBgOcr(); // 언어가 바뀌면 진행 중인 배경 인식 중지 (결과 키가 달라짐)
     resetOcr(e.target.value); // 워커 풀을 새 언어로 재구성
-    // 언어가 바뀌면 기존 OCR 결과 무효화
-    for (const [k, v] of state.contentCache) {
-      if (v.source === 'ocr') state.contentCache.delete(k);
-    }
-    if (state.mode === 'reader' && state.contentCache.size === 0) showPage(state.page, { keepSub: true });
+    dropOcrCache();
   });
+
+  // OCR 엔진 선택·클라우드 키 입력
+  $('set-ocr-engine').addEventListener('change', (e) => {
+    state.settings.ocrEngine = e.target.value;
+    saveSettings();
+    syncSettingsUI();
+    stopBgOcr(); // 엔진이 바뀌면 결과 키가 달라지므로 중지
+    cloudNotified.clear(); // 새 엔진에 대한 오류 알림 다시 허용
+    dropOcrCache();
+    refreshBgIdleStatus();
+  });
+  const bindKeyInput = (id, prop) =>
+    $(id).addEventListener('change', (e) => {
+      state.settings[prop] = e.target.value.trim();
+      saveSettings();
+      cloudNotified.clear();
+    });
+  bindKeyInput('set-clova-url', 'clovaUrl');
+  bindKeyInput('set-clova-secret', 'clovaSecret');
+  bindKeyInput('set-gvision-key', 'gvisionKey');
+
+  // 키 확인: 작은 테스트 이미지 1장으로 실제 호출 (클라우드 요금 1건 미만 수준)
+  $('btn-key-test').addEventListener('click', async () => {
+    const out = $('key-test-result');
+    const engine = state.settings.ocrEngine;
+    if (engine === 'tesseract') return;
+    out.className = 'key-test-result';
+    out.textContent = '확인 중…';
+    const c = document.createElement('canvas');
+    c.width = 240;
+    c.height = 80;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, 240, 80);
+    ctx.fillStyle = '#000';
+    ctx.font = '32px sans-serif';
+    ctx.fillText('TEST 123', 20, 50);
+    try {
+      await cloudOcrPage(engine, c, cloudCfg(engine), state.settings.ocrLang);
+      out.classList.add('ok');
+      out.textContent = '✓ 연결 성공';
+    } catch (err) {
+      out.classList.add('bad');
+      out.textContent = `✗ ${err.message}`;
+    } finally {
+      c.width = c.height = 0;
+    }
+  });
+}
+
+// OCR 결과 메모리 캐시 무효화 후 현재 페이지 다시 표시
+function dropOcrCache() {
+  for (const [k, v] of state.contentCache) {
+    if (v.source === 'ocr') state.contentCache.delete(k);
+  }
+  if (state.pdf && state.mode === 'reader') showPage(state.page, { keepSub: true });
 }
 
 let rerenderTimer = null;
@@ -662,6 +792,15 @@ function syncSettingsUI() {
   $('set-max-width').value = s.maxWidth;
   $('val-max-width').textContent = `${s.maxWidth}px`;
   $('set-ocr-lang').value = s.ocrLang;
+  $('set-ocr-engine').value = s.ocrEngine;
+  $('set-clova-url').value = s.clovaUrl;
+  $('set-clova-secret').value = s.clovaSecret;
+  $('set-gvision-key').value = s.gvisionKey;
+  const cloud = s.ocrEngine !== 'tesseract';
+  $('cloud-keys-clova').hidden = s.ocrEngine !== 'clova';
+  $('cloud-keys-gvision').hidden = s.ocrEngine !== 'gvision';
+  $('cloud-key-row').hidden = !cloud;
+  $('cloud-keys-note').hidden = !cloud;
 }
 
 // ===== 초기화 =====

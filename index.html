@@ -137,6 +137,30 @@
       <option value="eng+kor">영어 + 한국어</option>
     </select>
   </section>
+
+  <section class="settings-group">
+    <h3>OCR 엔진 <small>(스캔 PDF용)</small></h3>
+    <select id="set-ocr-engine">
+      <option value="tesseract">기기 내 인식 — 무료, 기본</option>
+      <option value="clova">CLOVA OCR — 한국어 최고 정밀 (키 필요)</option>
+      <option value="gvision">Google Vision — 정밀 (키 필요)</option>
+    </select>
+    <div id="cloud-keys-clova" class="cloud-keys" hidden>
+      <input id="set-clova-url" type="url" placeholder="CLOVA Invoke URL" autocomplete="off">
+      <input id="set-clova-secret" type="password" placeholder="X-OCR-SECRET 키 (프록시 사용 시 비움)" autocomplete="off">
+    </div>
+    <div id="cloud-keys-gvision" class="cloud-keys" hidden>
+      <input id="set-gvision-key" type="password" placeholder="Google API 키" autocomplete="off">
+    </div>
+    <div id="cloud-key-row" class="cloud-key-row" hidden>
+      <button id="btn-key-test" class="btn">키 확인</button>
+      <span id="key-test-result" class="key-test-result"></span>
+    </div>
+    <p id="cloud-keys-note" class="keys-note" hidden>
+      키는 이 기기(브라우저)에만 저장됩니다. 페이지 이미지가 해당 클라우드로 전송되며,
+      호출량에 따라 요금이 발생할 수 있습니다. 발급 방법은 README 참고.
+    </p>
+  </section>
 </aside>
 
 <button id="translate-btn" class="translate-btn" hidden>🌐 번역</button>
